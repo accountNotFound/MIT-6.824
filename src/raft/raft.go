@@ -163,8 +163,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term            int
+	Success         bool
+	ExpectNextIndex int
 }
 
 // example RequestVote RPC handler.
@@ -176,13 +177,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
 		return
 	}
-	voteFor := rf.voteFor
-	if args.Term > rf.currentTerm {
-		// set voteFor = -1 here so that it can enter the vote branch below
-		// useUpdate finally
-		voteFor = -1
-	}
-	if voteFor == -1 || voteFor == args.CandidateId {
+	if args.Term > rf.currentTerm || rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 		if args.LastLogTerm > rf.log.At(-1).Term ||
 			args.LastLogTerm == rf.log.At(-1).Term && args.LastLogIndex >= rf.log.At(-1).Index {
 			rf.useUpdate(func() string {
@@ -217,10 +212,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return location
 		})
 	}
-	// DPrintf("%s: [%d] cancel next election", location, rf.me)
 	rf.resetElectionTimer()
-	// TODO: 2B
+	if args.PrevLogIndex >= rf.log.Size() {
+		reply.Term, reply.Success = rf.currentTerm, false
+		reply.ExpectNextIndex = rf.log.Size()
+		return
+	}
+	if rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
+		prevTermIndex := args.PrevLogIndex
+		for prevTermIndex >= 0 && rf.log.At(prevTermIndex).Term == rf.log.At(args.PrevLogIndex).Term {
+			prevTermIndex--
+		}
+		reply.Term, reply.Success = rf.currentTerm, false
+		reply.ExpectNextIndex = prevTermIndex + 1
+		return
+	}
+	if len(args.Entries) > 0 {
+		logSlice := MakeLog(args.Entries)
+		diffTermIndex := args.PrevLogIndex + 1
+		for ; diffTermIndex < rf.log.Size() && diffTermIndex < logSlice.Size(); diffTermIndex++ {
+			if rf.log.At(diffTermIndex).Term != logSlice.At(diffTermIndex).Term {
+				break
+			}
+		}
+		rf.log.Truncate(diffTermIndex)
+		rf.log.Extend(logSlice.Slice(diffTermIndex, logSlice.Size()))
+		// TODO: 2C persist
+	}
+	rf.commitIndex = Max(rf.commitIndex, args.LeaderCommit)
 	reply.Term, reply.Success = rf.currentTerm, true
+	reply.ExpectNextIndex = rf.log.Size()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -296,7 +317,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			return location
 		})
 	}
-	// TODO: 2B
+	debug := fmt.Sprintf("[%d] update next[%d]: %d->%d",
+		rf.me, server, rf.nextIndex[server], reply.ExpectNextIndex)
+	rf.nextIndex[server] = reply.ExpectNextIndex
+	if reply.Success {
+		median := Median(rf.nextIndex)
+		if median-1 > rf.commitIndex {
+			debug = fmt.Sprintf("%s, update commit: %d->%d", debug, rf.commitIndex, median-1)
+			rf.commitIndex = median - 1
+		}
+	}
+	DPrintf(debug)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -312,13 +343,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		return -1, -1, false
+	}
+	rf.log.Append(LogEntry{
+		Term:    rf.currentTerm,
+		Index:   rf.log.At(-1).Index + 1,
+		Command: command,
+	})
+	DPrintf("[%d] ----------- start %s", rf.me, rf.log.At(-1).String())
+	// TODO: 2C persist
+	return rf.log.At(-1).Index, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -346,6 +383,7 @@ func (rf *Raft) startHeartbeat() {
 	rf.resetHeartbeatTimer()
 	for i := range rf.peers {
 		if i == rf.me {
+			rf.nextIndex[rf.me] = rf.log.Size()
 			continue
 		}
 		args := &AppendEntriesArgs{
@@ -401,16 +439,13 @@ func (rf *Raft) startElection() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		peers:       peers,
-		persister:   persister,
-		me:          me,
-		dead:        0,
-		currentTerm: 0,
-		voteFor:     -1,
-		log: Log{
-			Buffer: make([]LogEntry, 1),
-			Offset: 0,
-		},
+		peers:            peers,
+		persister:        persister,
+		me:               me,
+		dead:             0,
+		currentTerm:      0,
+		voteFor:          -1,
+		log:              MakeLog(nil),
 		commitIndex:      0,
 		lastApplied:      0,
 		state:            Follower,
@@ -419,11 +454,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		heartbeatTimer:   time.NewTimer(1000 * time.Second),
 		nextIndex:        make([]int, len(peers)),
 		matchIndex:       make([]int, len(peers)),
-	}
-	*rf.log.At(-1) = LogEntry{
-		Term:    0,
-		Index:   0,
-		Command: nil,
 	}
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
@@ -458,6 +488,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Unlock()
 		}
 	}()
+	go func() {
+		for !rf.killed() {
+			rf.mu.Lock()
+			commitIndex := rf.commitIndex
+			rf.mu.Unlock()
+
+			if rf.lastApplied == commitIndex {
+				time.Sleep(time.Duration(50) * time.Millisecond)
+				continue
+			}
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log.At(i).Command,
+					CommandIndex: rf.log.At(i).Index,
+					// TODO: 2D snapshot
+				}
+				DPrintf("[%d] ----------- apply %s", rf.me, rf.log.At(-1))
+			}
+			rf.lastApplied = commitIndex
+		}
+	}()
 
 	return rf
 }
@@ -467,7 +519,7 @@ func (rf *Raft) useUpdate(convert func() string) {
 	location := convert()
 	after := rf.String()
 	DPrintf("[%d] %s -> %s in %s", rf.me, before, after, location)
-	// TODO: persist
+	rf.persist()
 }
 
 func (rf *Raft) setTerm(term int) {
@@ -482,13 +534,13 @@ func (rf *Raft) setTerm(term int) {
 
 func (rf *Raft) resetElectionTimer() {
 	rf.electionTimer.Stop()
-	d := 300 + rand.Int63n(100)
+	d := 300 + rand.Int63n(150)
 	rf.electionTimer.Reset(time.Duration(d) * time.Millisecond)
 }
 
 func (rf *Raft) resetHeartbeatTimer() {
 	rf.heartbeatTimer.Stop()
-	d := 150
+	d := 120
 	rf.heartbeatTimer.Reset(time.Duration(d) * time.Millisecond)
 }
 

@@ -1,35 +1,70 @@
 package raft
 
+import "fmt"
+
 type LogEntry struct {
 	Term    int
 	Index   int
 	Command interface{}
 }
 
+func (e *LogEntry) String() string {
+	return fmt.Sprintf("{index=%d, term=%d, cmd=%v}", e.Index, e.Term, e.Term)
+}
+
 type Log struct {
-	Buffer []LogEntry
-	Offset int
+	buffer []LogEntry
+}
+
+func MakeLog(entries []LogEntry) Log {
+	res := Log{}
+	if entries == nil {
+		res.buffer = make([]LogEntry, 1)
+		res.buffer[0] = LogEntry{
+			Term:    0,
+			Index:   0,
+			Command: nil,
+		}
+	} else {
+		res.buffer = entries
+	}
+	return res
 }
 
 func (log *Log) Size() int {
-	return log.Offset + len(log.Buffer)
+	return log.buffer[0].Index + len(log.buffer)
 }
 
 func (log *Log) At(index int) *LogEntry {
 	if index < 0 {
-		index += len(log.Buffer)
+		index += log.Size()
 	}
-	return &log.Buffer[index-log.Offset]
+	return &log.buffer[index-log.buffer[0].Index]
 }
 
 func (log *Log) Slice(begin, end int) []LogEntry {
 	if begin < 0 {
-		begin += len(log.Buffer)
+		begin += log.Size()
 	}
 	if end < 0 {
-		end += len(log.Buffer)
+		end += log.Size()
 	}
-	return log.Buffer[begin-log.Offset : end-log.Offset]
+	return log.buffer[begin-log.buffer[0].Index : end-log.buffer[0].Index]
+}
+
+func (log *Log) Append(entry LogEntry) {
+	log.buffer = append(log.buffer, entry)
+}
+
+func (log *Log) Extend(entries []LogEntry) {
+	log.buffer = append(log.buffer, entries...)
+}
+
+func (log *Log) Truncate(index int) {
+	if index < 0 {
+		index += log.Size()
+	}
+	log.buffer = log.buffer[0 : index-log.buffer[0].Index]
 }
 
 type RaftState int

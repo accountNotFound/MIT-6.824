@@ -1,13 +1,30 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"sort"
+)
 
 // Debugging
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func Median(arr []int) int {
+	dup := make([]int, len(arr))
+	copy(dup, arr)
+	sort.Ints(dup)
+	return dup[len(dup)/2]
+}
+
+func Max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
