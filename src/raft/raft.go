@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -64,7 +66,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	voteFor     int
-	log         Log
+	log         LogEntries
 
 	commitIndex      int
 	lastApplied      int
@@ -91,12 +93,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	// DPrintf("[%d] persist, log=%v", rf.me, rf.log)
 }
 
 // restore previously persisted state.
@@ -106,17 +110,14 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.voteFor) != nil ||
+		d.Decode(&rf.log) != nil {
+		panic("load rf state failed: %v")
+	}
+	DPrintf("[%d] reload, log=%v", rf.me, rf.log)
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -158,7 +159,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []LogEntry
+	Entries      LogEntries
 	LeaderCommit int
 }
 
@@ -227,17 +228,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ExpectNextIndex = prevTermIndex + 1
 		return
 	}
-	if len(args.Entries) > 0 {
-		logSlice := MakeLog(args.Entries)
+	if args.Entries != nil {
 		diffTermIndex := args.PrevLogIndex + 1
-		for ; diffTermIndex < rf.log.Size() && diffTermIndex < logSlice.Size(); diffTermIndex++ {
-			if rf.log.At(diffTermIndex).Term != logSlice.At(diffTermIndex).Term {
+		for ; diffTermIndex < rf.log.Size() && diffTermIndex < args.Entries.Size(); diffTermIndex++ {
+			if rf.log.At(diffTermIndex).Term != args.Entries.At(diffTermIndex).Term {
 				break
 			}
 		}
-		rf.log.Truncate(diffTermIndex)
-		rf.log.Extend(logSlice.Slice(diffTermIndex, logSlice.Size()))
-		// TODO: 2C persist
+		rf.useUpdate(func() string {
+			rf.log.Truncate(diffTermIndex)
+			rf.log.Extend(args.Entries.Slice(diffTermIndex, args.Entries.Size()))
+			return location
+		}, true)
 	}
 	rf.commitIndex = Max(rf.commitIndex, args.LeaderCommit)
 	reply.Term, reply.Success = rf.currentTerm, true
@@ -294,6 +296,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		if rf.voteGrantedCount > len(rf.peers)/2 && rf.state != Leader {
 			rf.useUpdate(func() string {
 				rf.state = Leader
+				// see figure 8
+				rf.log.Append(LogEntry{
+					Term:    rf.currentTerm,
+					Index:   rf.log.At(-1).Index + 1,
+					Command: nil,
+				})
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = Min(rf.nextIndex[i], rf.log.Size())
+				}
 				return location
 			})
 			rf.startHeartbeat()
@@ -322,7 +333,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.nextIndex[server] = reply.ExpectNextIndex
 	if reply.Success {
 		median := Median(rf.nextIndex)
-		if median-1 > rf.commitIndex {
+		// see figure 8
+		if median-1 > rf.commitIndex && rf.log.At(median-1).Term == rf.currentTerm {
 			debug = fmt.Sprintf("%s, update commit: %d->%d", debug, rf.commitIndex, median-1)
 			rf.commitIndex = median - 1
 		}
@@ -348,13 +360,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state != Leader {
 		return -1, -1, false
 	}
-	rf.log.Append(LogEntry{
-		Term:    rf.currentTerm,
-		Index:   rf.log.At(-1).Index + 1,
-		Command: command,
-	})
+	rf.useUpdate(func() string {
+		rf.log.Append(LogEntry{
+			Term:    rf.currentTerm,
+			Index:   rf.log.At(-1).Index + 1,
+			Command: command,
+		})
+		return "Start"
+	}, true)
 	DPrintf("[%d] ----------- start %s", rf.me, rf.log.At(-1).String())
-	// TODO: 2C persist
 	return rf.log.At(-1).Index, rf.currentTerm, true
 }
 
@@ -368,8 +382,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	DPrintf("[%d] ----------- crash", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -444,8 +460,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		me:               me,
 		dead:             0,
 		currentTerm:      0,
-		voteFor:          -1,
-		log:              MakeLog(nil),
+		voteFor:          0, // set to -1 below to avoid labgob warning
+		log:              make(LogEntries, 0),
 		commitIndex:      0,
 		lastApplied:      0,
 		state:            Follower,
@@ -455,15 +471,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:        make([]int, len(peers)),
 		matchIndex:       make([]int, len(peers)),
 	}
+
+	if rf.persister.RaftStateSize() == 0 {
+		rf.voteFor = -1
+		rf.log.Append(LogEntry{
+			Term:    0,
+			Index:   0,
+			Command: nil,
+		})
+	} else {
+		// initialize from state persisted before a crash
+		rf.readPersist(persister.ReadRaftState())
+	}
+
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = rf.log.Size()
 	}
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go func() {
@@ -514,7 +540,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) useUpdate(convert func() string) {
+func (rf *Raft) useUpdate(convert func() string, disableLogging ...bool) {
+	if len(disableLogging) > 0 && disableLogging[0] {
+		convert()
+		rf.persist()
+		return
+	}
 	before := rf.String()
 	location := convert()
 	after := rf.String()
