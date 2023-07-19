@@ -229,6 +229,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if args.Entries != nil {
+		// TODO: 2D args.Entries are all or partial snapshot
 		diffTermIndex := args.PrevLogIndex + 1
 		for ; diffTermIndex < rf.log.Size() && diffTermIndex < args.Entries.Size(); diffTermIndex++ {
 			if rf.log.At(diffTermIndex).Term != args.Entries.At(diffTermIndex).Term {
@@ -241,7 +242,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return location
 		}, true)
 	}
-	rf.commitIndex = Max(rf.commitIndex, args.LeaderCommit)
+	rf.commitIndex = Max(rf.commitIndex, Min(args.LeaderCommit, rf.log.Size()))
 	reply.Term, reply.Success = rf.currentTerm, true
 	reply.ExpectNextIndex = rf.log.Size()
 }
@@ -296,14 +297,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		if rf.voteGrantedCount > len(rf.peers)/2 && rf.state != Leader {
 			rf.useUpdate(func() string {
 				rf.state = Leader
-				// see figure 8
-				rf.log.Append(LogEntry{
-					Term:    rf.currentTerm,
-					Index:   rf.log.At(-1).Index + 1,
-					Command: nil,
-				})
+
+				// NOTE: see figure 8.
+				// unfortunately, append this no-op can not pass lab 2B
+				// rf.log.Append(LogEntry{
+				// 	Term:    rf.currentTerm,
+				// 	Index:   rf.log.At(-1).Index + 1,
+				// 	Command: nil,
+				// })
+
 				for i := range rf.nextIndex {
 					rf.nextIndex[i] = Min(rf.nextIndex[i], rf.log.Size())
+					rf.matchIndex[i] = 0
 				}
 				return location
 			})
@@ -328,15 +333,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			return location
 		})
 	}
-	debug := fmt.Sprintf("[%d] update next[%d]: %d->%d",
-		rf.me, server, rf.nextIndex[server], reply.ExpectNextIndex)
+	debug := fmt.Sprintf("[%d] update next[%d]: %d->%d", rf.me, server, rf.nextIndex[server], reply.ExpectNextIndex)
 	rf.nextIndex[server] = reply.ExpectNextIndex
 	if reply.Success {
-		median := Median(rf.nextIndex)
-		// see figure 8
-		if median-1 > rf.commitIndex && rf.log.At(median-1).Term == rf.currentTerm {
-			debug = fmt.Sprintf("%s, update commit: %d->%d", debug, rf.commitIndex, median-1)
-			rf.commitIndex = median - 1
+		rf.matchIndex[server] = reply.ExpectNextIndex - 1
+		median := Median(rf.matchIndex)
+
+		// NOTE: see figure 8
+		if median > rf.commitIndex && rf.log.At(median).Term == rf.currentTerm {
+			debug = fmt.Sprintf("%s, update commit: %d->%d", debug, rf.commitIndex, median)
+			rf.commitIndex = median
 		}
 	}
 	DPrintf(debug)
@@ -400,8 +406,10 @@ func (rf *Raft) startHeartbeat() {
 	for i := range rf.peers {
 		if i == rf.me {
 			rf.nextIndex[rf.me] = rf.log.Size()
+			rf.matchIndex[rf.me] = rf.log.Size() - 1
 			continue
 		}
+		rf.nextIndex[i] = Min(rf.nextIndex[i], rf.log.Size())
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
