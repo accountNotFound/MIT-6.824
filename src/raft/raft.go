@@ -205,6 +205,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
+		reply.ExpectNextIndex = -1
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -213,6 +214,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return location
 		})
 	}
+	rf.state = Follower
 	rf.resetElectionTimer()
 	if args.PrevLogIndex >= rf.log.Size() {
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -221,7 +223,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
 		prevTermIndex := args.PrevLogIndex
-		for prevTermIndex >= 0 && rf.log.At(prevTermIndex).Term == rf.log.At(args.PrevLogIndex).Term {
+		for prevTermIndex > 0 && rf.log.At(prevTermIndex).Term == rf.log.At(args.PrevLogIndex).Term {
 			prevTermIndex--
 		}
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -242,7 +244,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return location
 		}, true)
 	}
-	rf.commitIndex = Max(rf.commitIndex, Min(args.LeaderCommit, rf.log.Size()))
+	commit := Min(args.LeaderCommit, rf.log.Size())
+	if commit > rf.commitIndex {
+		DPrintf("[%d] update commit: %d->%d", rf.me, rf.commitIndex, commit)
+		rf.commitIndex = commit
+	}
 	reply.Term, reply.Success = rf.currentTerm, true
 	reply.ExpectNextIndex = rf.log.Size()
 }
@@ -294,7 +300,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if reply.VoteGranted {
 		DPrintf("[%d] get vote from [%d]", rf.me, server)
 		rf.voteGrantedCount++
-		if rf.voteGrantedCount > len(rf.peers)/2 && rf.state != Leader {
+		if rf.voteGrantedCount > len(rf.peers)/2 && rf.state == Candidate {
 			rf.useUpdate(func() string {
 				rf.state = Leader
 
@@ -333,10 +339,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			return location
 		})
 	}
-	debug := fmt.Sprintf("[%d] update next[%d]: %d->%d", rf.me, server, rf.nextIndex[server], reply.ExpectNextIndex)
-	rf.nextIndex[server] = reply.ExpectNextIndex
+	debug := fmt.Sprintf("[%d], commit=%d", rf.me, rf.commitIndex)
+	if reply.ExpectNextIndex != -1 && reply.ExpectNextIndex != rf.nextIndex[server] {
+		debug = fmt.Sprintf("%s, update next[%d]: %d->%d", debug, server, rf.nextIndex[server], reply.ExpectNextIndex)
+		rf.nextIndex[server] = reply.ExpectNextIndex
+	}
 	if reply.Success {
-		rf.matchIndex[server] = reply.ExpectNextIndex - 1
+		rf.matchIndex[server] = args.PrevLogIndex + len([]LogEntry(args.Entries))
 		median := Median(rf.matchIndex)
 
 		// NOTE: see figure 8
@@ -524,9 +533,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 	go func() {
 		for !rf.killed() {
-			rf.mu.Lock()
 			commitIndex := rf.commitIndex
-			rf.mu.Unlock()
 
 			if rf.lastApplied == commitIndex {
 				time.Sleep(time.Duration(50) * time.Millisecond)
@@ -539,7 +546,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					CommandIndex: rf.log.At(i).Index,
 					// TODO: 2D snapshot
 				}
-				DPrintf("[%d] ----------- apply %s", rf.me, rf.log.At(-1))
+				DPrintf("[%d] ----------- apply %s", rf.me, rf.log.At(i))
 			}
 			rf.lastApplied = commitIndex
 		}
