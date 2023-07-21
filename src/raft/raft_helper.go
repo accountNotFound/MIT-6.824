@@ -9,7 +9,7 @@ type LogEntry struct {
 }
 
 func (e *LogEntry) String() string {
-	return fmt.Sprintf("{index=%d, term=%d, cmd=%v}", e.Index, e.Term, e.Term)
+	return fmt.Sprintf("{index=%d, term=%d, cmd=%v}", e.Index, e.Term, e.Command)
 }
 
 type LogEntries []LogEntry

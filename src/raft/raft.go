@@ -183,8 +183,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			args.LastLogTerm == rf.log.At(-1).Term && args.LastLogIndex >= rf.log.At(-1).Index {
 			rf.useUpdate(func() string {
 				rf.setTerm(args.Term)
+				rf.resetElectionTimer()
 				rf.voteFor = args.CandidateId
-				return location
+				return location + fmt.Sprintf(" granting vote to [%d]", args.CandidateId)
 			})
 			reply.Term, reply.VoteGranted = rf.currentTerm, true
 			return
@@ -297,10 +298,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		})
 		return
 	}
+	if rf.state != Candidate {
+		return
+	}
 	if reply.VoteGranted {
 		DPrintf("[%d] get vote from [%d]", rf.me, server)
 		rf.voteGrantedCount++
-		if rf.voteGrantedCount > len(rf.peers)/2 && rf.state == Candidate {
+		if rf.voteGrantedCount > len(rf.peers)/2 {
 			rf.useUpdate(func() string {
 				rf.state = Leader
 
@@ -314,7 +318,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 				for i := range rf.nextIndex {
 					rf.nextIndex[i] = Min(rf.nextIndex[i], rf.log.Size())
-					rf.matchIndex[i] = 0
+					rf.matchIndex[i] = rf.commitIndex
 				}
 				return location
 			})
@@ -339,9 +343,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			return location
 		})
 	}
-	debug := fmt.Sprintf("[%d], commit=%d", rf.me, rf.commitIndex)
-	if reply.ExpectNextIndex != -1 && reply.ExpectNextIndex != rf.nextIndex[server] {
-		debug = fmt.Sprintf("%s, update next[%d]: %d->%d", debug, server, rf.nextIndex[server], reply.ExpectNextIndex)
+	if rf.state != Leader {
+		return
+	}
+	nextMsg := ""
+	commitMsg := ""
+	if reply.ExpectNextIndex != -1 {
+		if reply.ExpectNextIndex != rf.nextIndex[server] {
+			nextMsg = fmt.Sprintf("update next[%d]: %d->%d", server, rf.nextIndex[server], reply.ExpectNextIndex)
+		}
 		rf.nextIndex[server] = reply.ExpectNextIndex
 	}
 	if reply.Success {
@@ -350,11 +360,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		// NOTE: see figure 8
 		if median > rf.commitIndex && rf.log.At(median).Term == rf.currentTerm {
-			debug = fmt.Sprintf("%s, update commit: %d->%d", debug, rf.commitIndex, median)
+			commitMsg = fmt.Sprintf("update commit: %d->%d", rf.commitIndex, median)
 			rf.commitIndex = median
 		}
 	}
-	DPrintf(debug)
+	if nextMsg != "" || commitMsg != "" {
+		DPrintf("[%d] %s %s", rf.me, nextMsg, commitMsg)
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -516,6 +528,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Lock()
 			if rf.state != Leader {
 				rf.startElection()
+			} else {
+				rf.resetElectionTimer()
 			}
 			rf.mu.Unlock()
 		}
@@ -574,7 +588,6 @@ func (rf *Raft) setTerm(term int) {
 		rf.state = Follower
 		rf.voteFor = -1
 		rf.voteGrantedCount = 0
-		rf.resetElectionTimer()
 	}
 }
 
