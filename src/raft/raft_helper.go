@@ -9,62 +9,54 @@ type LogEntry struct {
 }
 
 func (e *LogEntry) String() string {
-	return fmt.Sprintf("{index=%d, term=%d, cmd=%v}", e.Index, e.Term, e.Term)
+	return fmt.Sprintf("{index=%d, term=%d, cmd=%v}", e.Index, e.Term, e.Command)
 }
 
-type Log struct {
-	buffer []LogEntry
+type LogEntries []LogEntry
+
+func (log *LogEntries) Size() int {
+	buffer := ([]LogEntry)(*log)
+	return buffer[0].Index + len(buffer)
 }
 
-func MakeLog(entries []LogEntry) Log {
-	res := Log{}
-	if entries == nil {
-		res.buffer = make([]LogEntry, 1)
-		res.buffer[0] = LogEntry{
-			Term:    0,
-			Index:   0,
-			Command: nil,
-		}
-	} else {
-		res.buffer = entries
-	}
-	return res
-}
-
-func (log *Log) Size() int {
-	return log.buffer[0].Index + len(log.buffer)
-}
-
-func (log *Log) At(index int) *LogEntry {
+func (log *LogEntries) At(index int) *LogEntry {
 	if index < 0 {
 		index += log.Size()
 	}
-	return &log.buffer[index-log.buffer[0].Index]
+	buffer := ([]LogEntry)(*log)
+	return &buffer[index-buffer[0].Index]
 }
 
-func (log *Log) Slice(begin, end int) []LogEntry {
+func (log *LogEntries) Slice(begin, end int) LogEntries {
 	if begin < 0 {
 		begin += log.Size()
 	}
 	if end < 0 {
 		end += log.Size()
 	}
-	return log.buffer[begin-log.buffer[0].Index : end-log.buffer[0].Index]
+	if begin >= end {
+		return nil
+	}
+	buffer := ([]LogEntry)(*log)
+	return buffer[begin-buffer[0].Index : end-buffer[0].Index]
 }
 
-func (log *Log) Append(entry LogEntry) {
-	log.buffer = append(log.buffer, entry)
+func (log *LogEntries) Append(entry LogEntry) {
+	buffer := ([]LogEntry)(*log)
+	*log = LogEntries(append(buffer, entry))
 }
 
-func (log *Log) Extend(entries []LogEntry) {
-	log.buffer = append(log.buffer, entries...)
+func (log *LogEntries) Extend(entries []LogEntry) {
+	buffer := ([]LogEntry)(*log)
+	*log = LogEntries(append(buffer, entries...))
 }
 
-func (log *Log) Truncate(index int) {
+func (log *LogEntries) Truncate(index int) {
 	if index < 0 {
 		index += log.Size()
 	}
-	log.buffer = log.buffer[0 : index-log.buffer[0].Index]
+	buffer := ([]LogEntry)(*log)
+	*log = LogEntries(buffer[0 : index-buffer[0].Index])
 }
 
 type RaftState int
