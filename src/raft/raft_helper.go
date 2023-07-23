@@ -20,9 +20,7 @@ func (log *LogEntries) Size() int {
 }
 
 func (log *LogEntries) At(index int) *LogEntry {
-	if index < 0 {
-		index += log.Size()
-	}
+	index = log.offset(index)
 	buffer := ([]LogEntry)(*log)
 	return &buffer[index-buffer[0].Index]
 }
@@ -32,13 +30,27 @@ func (log *LogEntries) Head() *LogEntry {
 	return &buffer[0]
 }
 
+func (log *LogEntries) ApplyMsgAt(index int, persister *Persister) (ApplyMsg, int) {
+	if index < log.Head().Index {
+		return ApplyMsg{}, -1
+	}
+	msg := ApplyMsg{
+		CommandValid: true,
+		Command:      log.At(index).Command,
+		CommandIndex: log.At(index).Index,
+	}
+	if index == log.Head().Index {
+		msg.SnapshotValid = true
+		msg.Snapshot = persister.ReadSnapshot()
+		msg.SnapshotIndex = index
+		msg.SnapshotTerm = log.At(index).Term
+	}
+	return msg, log.At(index).Term
+}
+
 func (log *LogEntries) Slice(begin, end int) LogEntries {
-	if begin < 0 {
-		begin += log.Size()
-	}
-	if end < 0 {
-		end += log.Size()
-	}
+	begin = log.offset(begin)
+	end = log.offset(end)
 	if begin >= end {
 		return nil
 	}
@@ -58,20 +70,23 @@ func (log *LogEntries) Extend(entries []LogEntry) {
 
 // drop all entries after given index, including this one
 func (log *LogEntries) Truncate(index int) {
-	if index < 0 {
-		index += log.Size()
-	}
+	index = log.offset(index)
 	buffer := ([]LogEntry)(*log)
 	*log = LogEntries(buffer[0 : index-buffer[0].Index])
 }
 
 // drop all entries before given index, not include this one
 func (log *LogEntries) Trim(index int) {
+	index = log.offset(index)
+	buffer := ([]LogEntry)(*log)
+	*log = LogEntries(buffer[index-buffer[0].Index:])
+}
+
+func (log *LogEntries) offset(index int) int {
 	if index < 0 {
 		index += log.Size()
 	}
-	buffer := ([]LogEntry)(*log)
-	*log = LogEntries(buffer[index-buffer[0].Index:])
+	return index
 }
 
 type RaftState int
