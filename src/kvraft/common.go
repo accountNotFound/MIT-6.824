@@ -20,7 +20,7 @@ const (
 )
 
 // the timeout control for network package
-const TTL = time.Duration(200) * time.Millisecond
+const TTL = time.Duration(500) * time.Millisecond
 
 type Err string
 
@@ -47,6 +47,9 @@ type Response struct {
 }
 
 func (req *Request) String() string {
+	if req.Op == OpGet {
+		return fmt.Sprintf("{seq=%v op=%v key='%v'}", req.SeqNum, req.Op, req.Key)
+	}
 	return fmt.Sprintf("{seq=%v op=%v key='%v' value='%v'}", req.SeqNum, req.Op, req.Key, req.Value)
 }
 

@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -179,16 +179,12 @@ func (kv *KVServer) apply(req *Request, rsp *Response) {
 		kv.database[req.Key] = req.Value
 		rsp.Error = NoErr
 	case OpAppend:
-		if val, ok := kv.database[req.Key]; ok {
-			kv.database[req.Key] = val + req.Value
-		} else {
-			kv.database[req.Key] = req.Value
-		}
+		kv.database[req.Key] += req.Value
 		rsp.Error = NoErr
 	}
 	kv.retrycache[req.ClientId] = *rsp
 	if _, isLeader := kv.rf.GetState(); isLeader {
-		DPrintf("server [%d]: apply req=%s, rsp=%s", kv.me, req.String(), rsp.String())
+		DPrintf("server [%d]: apply req=%s", kv.me, req.String())
 	}
 }
 
