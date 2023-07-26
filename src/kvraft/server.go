@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -20,9 +20,30 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type Model struct {
-	Header
-	Body interface{} // it's type should be GetReply or PutAppendReply
+func (kv *KVServer) Access(req *Request, rsp *Response) {
+	rsp.Header = Header{
+		ClientId: req.ClientId,
+		ServerId: int64(kv.me),
+		SeqNum:   req.SeqNum,
+		CreateAt: time.Now(),
+	}
+	if kv.check(req, rsp) {
+		return
+	}
+	conn, index := kv.submit(req)
+	if index == -1 {
+		rsp.Error = ErrWrongLeader
+		return
+	}
+	select {
+	case result := <-conn:
+		rsp.Value, rsp.Error = result.Value, result.Error
+	case <-time.After(TTL * 2):
+		rsp.Error = ErrTimeout
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	delete(kv.connections, int64(index))
 }
 
 type KVServer struct {
@@ -36,38 +57,8 @@ type KVServer struct {
 
 	// Your definitions here.
 	database    map[string]string
-	connections map[int]chan Model
-	retrycache  map[int]Model
-}
-
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	req := Model{
-		Header: args.Header,
-		Body:   args,
-	}
-	success := func(res interface{}) {
-		*reply = res.(GetReply)
-	}
-	fail := func(err Err) {
-		reply.Err = err
-	}
-	kv.handle(req, success, fail)
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	req := Model{
-		Header: args.Header,
-		Body:   args,
-	}
-	success := func(res interface{}) {
-		*reply = res.(PutAppendReply)
-	}
-	fail := func(err Err) {
-		reply.Err = err
-	}
-	kv.handle(req, success, fail)
+	connections map[int64]chan Response
+	retrycache  map[int64]Response
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -104,7 +95,9 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Model{})
+	labgob.Register(Header{})
+	labgob.Register(Request{})
+	labgob.Register(Response{})
 
 	kv := &KVServer{
 		mu:           sync.Mutex{},
@@ -113,8 +106,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		dead:         0,
 		maxraftstate: maxraftstate,
 		database:     make(map[string]string),
-		connections:  make(map[int]chan Model),
-		retrycache:   make(map[int]Model),
+		connections:  make(map[int64]chan Response),
+		retrycache:   make(map[int64]Response),
 	}
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -122,131 +115,87 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func() {
 		for !kv.killed() {
 			applyMsg := <-kv.applyCh
-			kv.apply(&applyMsg)
+			req := applyMsg.Command.(Request)
+			rsp := Response{}
+			if ok := kv.check(&req, &rsp); !ok {
+				kv.apply(&req, &rsp)
+				time.AfterFunc(TTL, func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					if cache, ok := kv.retrycache[req.ClientId]; ok && cache.SeqNum == req.SeqNum {
+						delete(kv.retrycache, req.ClientId)
+					}
+				})
+			}
+			kv.send(int64(applyMsg.CommandIndex), &rsp)
 		}
 	}()
-
 	return kv
 }
 
-func (kv *KVServer) check(req Model, success func(interface{}), fail func(Err)) bool {
+func (kv *KVServer) check(req *Request, rsp *Response) bool {
+	if time.Since(req.CreateAt) > 2*TTL {
+		rsp.Error = ErrOutOfDate
+		return true
+	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if rsp, ok := kv.retrycache[req.ClientId]; !ok {
+	if cache, ok := kv.retrycache[req.ClientId]; !ok {
 		return false
-	} else if req.RequestId < rsp.RequestId {
-		fail(ErrOutOfDate)
+	} else if req.SeqNum < cache.SeqNum {
+		rsp.Error = cache.Error
 		return true
-	} else if req.RequestId == rsp.RequestId {
-		success(rsp.Body)
+	} else if req.SeqNum == cache.SeqNum {
+		rsp.Value, rsp.Error = cache.Value, NoErr
 		return true
 	} else {
 		return false
 	}
-
 }
 
-func (kv *KVServer) submit(req Model) (chan Model, int) {
+func (kv *KVServer) submit(req *Request) (chan Response, int64) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if index, _, isLeader := kv.rf.Start(req); !isLeader {
+	if index, _, isLeader := kv.rf.Start(*req); !isLeader {
 		return nil, -1
 	} else {
-		kv.connections[index] = make(chan Model)
-		return kv.connections[index], index
+		DPrintf("server [%d]: submit req=%s", kv.me, req.String())
+		kv.connections[int64(index)] = make(chan Response)
+		return kv.connections[int64(index)], int64(index)
 	}
 }
 
-func (kv *KVServer) handle(req Model, success func(interface{}), fail func(Err)) {
-	if kv.check(req, success, fail) {
-		return
-	}
-	conn, index := kv.submit(req)
-	if index == -1 {
-		return
-	}
-	select {
-	case rsp := <-conn:
-		success(rsp.Body)
-	case <-time.After(time.Duration(10) * time.Second):
-		fail(ErrTimeout)
-	}
+func (kv *KVServer) apply(req *Request, rsp *Response) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	delete(kv.connections, index)
-}
-
-func (kv *KVServer) apply(applyMsg *raft.ApplyMsg) {
-	req := applyMsg.Command.(Model)
-	switch args := req.Body.(type) {
-	case PutAppendArgs:
-		success := func(res interface{}) {
-			if conn, ok := kv.connections[applyMsg.CommandIndex]; ok {
-				conn <- Model{
-					Header: req.Header,
-					Body:   res.(PutAppendReply),
-				}
-			}
+	switch req.Op {
+	case OpGet:
+		if val, ok := kv.database[req.Key]; ok {
+			rsp.Value, rsp.Error = val, NoErr
+		} else {
+			rsp.Error = ErrNoKey
 		}
-		fail := func(err Err) {
-			if conn, ok := kv.connections[applyMsg.CommandIndex]; ok {
-				conn <- Model{
-					Header: req.Header,
-					Body:   PutAppendReply{Err: err},
-				}
-			}
+	case OpPut:
+		kv.database[req.Key] = req.Value
+		rsp.Error = NoErr
+	case OpAppend:
+		if val, ok := kv.database[req.Key]; ok {
+			kv.database[req.Key] = val + req.Value
+		} else {
+			kv.database[req.Key] = req.Value
 		}
-		if kv.check(req, success, fail) {
-			return
-		}
-		kv.mu.Lock()
-		kv.write(&args, success, fail)
-		kv.mu.Unlock()
-	case GetArgs:
-		success := func(res interface{}) {
-			if conn, ok := kv.connections[applyMsg.CommandIndex]; ok {
-				conn <- Model{
-					Header: req.Header,
-					Body:   res.(GetReply),
-				}
-			}
-		}
-		fail := func(err Err) {
-			if conn, ok := kv.connections[applyMsg.CommandIndex]; ok {
-				conn <- Model{
-					Header: req.Header,
-					Body:   GetReply{Err: err},
-				}
-			}
-		}
-		if kv.check(req, success, fail) {
-			return
-		}
-		kv.mu.Lock()
-		kv.read(&args, success, fail)
-		kv.mu.Unlock()
+		rsp.Error = NoErr
+	}
+	kv.retrycache[req.ClientId] = *rsp
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		DPrintf("server [%d]: apply req=%s, rsp=%s", kv.me, req.String(), rsp.String())
 	}
 }
 
-// call with lock
-func (kv *KVServer) write(args *PutAppendArgs, success func(interface{}), fail func(Err)) {
-	if _, ok := kv.database[args.Key]; !ok || args.Op == OpPut {
-		kv.database[args.Key] = args.Value
-	} else {
-		kv.database[args.Key] = args.Value
-	}
-	success(PutAppendReply{
-		Err: NoErr,
-	})
-}
-
-// call with lock
-func (kv *KVServer) read(args *GetArgs, success func(interface{}), fail func(Err)) {
-	if val, ok := kv.database[args.Key]; !ok {
-		fail(ErrNoKey)
-	} else {
-		success(GetReply{
-			Value: val,
-		})
+func (kv *KVServer) send(index int64, rsp *Response) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if conn, ok := kv.connections[index]; ok {
+		conn <- *rsp
 	}
 }

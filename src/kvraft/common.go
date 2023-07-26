@@ -1,5 +1,10 @@
 package kvraft
 
+import (
+	"fmt"
+	"time"
+)
+
 const (
 	NoErr          = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -14,35 +19,37 @@ const (
 	OpGet    = "Get"
 )
 
+// the timeout control for network package
+const TTL = time.Duration(200) * time.Millisecond
+
 type Err string
 
+type OpType string
+
 type Header struct {
-	ClientId  int
-	RequestId int
+	ClientId int64
+	ServerId int64 // for debug
+	SeqNum   int64
+	CreateAt time.Time
 }
 
-// Put or Append
-type PutAppendArgs struct {
+type Request struct {
 	Header
+	Op    OpType
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 }
 
-type PutAppendReply struct {
-	Err Err
-}
-
-type GetArgs struct {
+type Response struct {
 	Header
-	Key string
-	// You'll have to add definitions here.
+	Value string
+	Error Err
 }
 
-type GetReply struct {
-	Err   Err
-	Value string
+func (req *Request) String() string {
+	return fmt.Sprintf("{seq=%v op=%v key='%v' value='%v'}", req.SeqNum, req.Op, req.Key, req.Value)
+}
+
+func (rsp *Response) String() string {
+	return fmt.Sprintf("{value='%v', err=%v}", rsp.Value, rsp.Error)
 }
