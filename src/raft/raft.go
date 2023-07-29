@@ -572,7 +572,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Unlock()
 
 			if applyIndex == commitIndex {
-				time.Sleep(time.Duration(50) * time.Millisecond)
+				time.Sleep(time.Duration(10) * time.Millisecond)
 				continue
 			}
 			for i := applyIndex + 1; i <= commitIndex; i++ {

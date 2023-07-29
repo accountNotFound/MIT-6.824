@@ -1,33 +1,53 @@
 package kvraft
 
+import (
+	"fmt"
+)
+
 const (
-	OK             = "OK"
+	NoErr          = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrOutOfDate   = "ErrOutOfDate"
+	ErrTimeout     = "ErrTimeout"
+)
+
+const (
+	OpPut    = "Put"
+	OpAppend = "Append"
+	OpGet    = "Get"
 )
 
 type Err string
 
-// Put or Append
-type PutAppendArgs struct {
+type OpType string
+
+type Header struct {
+	ClientId int64
+	ServerId int64 // for debug
+	SeqNum   int64
+}
+
+type Request struct {
+	Header
+	Op    OpType
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 }
 
-type PutAppendReply struct {
-	Err Err
-}
-
-type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
-}
-
-type GetReply struct {
-	Err   Err
+type Response struct {
+	Header
 	Value string
+	Error Err
+}
+
+func (req *Request) String() string {
+	if req.Op == OpGet {
+		return fmt.Sprintf("{seq=%v op=%v key='%v'}", req.SeqNum, req.Op, req.Key)
+	}
+	return fmt.Sprintf("{seq=%v op=%v key='%v' value='%v'}", req.SeqNum, req.Op, req.Key, req.Value)
+}
+
+func (rsp *Response) String() string {
+	return fmt.Sprintf("{value='%v', err=%v, server=%d}", rsp.Value, rsp.Error, rsp.ServerId)
 }
