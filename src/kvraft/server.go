@@ -25,20 +25,23 @@ func (kv *KVServer) Access(req *Request, rsp *Response) {
 		ClientId: req.ClientId,
 		ServerId: int64(kv.me),
 		SeqNum:   req.SeqNum,
-		CreateAt: time.Now(),
 	}
 	if kv.check(req, rsp) {
 		return
 	}
-	conn, index := kv.submit(req)
+	conn, term, index := kv.submit(req)
 	if index == -1 {
 		rsp.Error = ErrWrongLeader
 		return
 	}
 	select {
 	case result := <-conn:
-		rsp.Value, rsp.Error = result.Value, result.Error
-	case <-time.After(TTL * 2):
+		if currentTerm, _ := kv.rf.GetState(); currentTerm == term {
+			rsp.Value, rsp.Error = result.Value, result.Error
+		} else {
+			rsp.Error = ErrWrongLeader
+		}
+	case <-time.After(3 * time.Second):
 		rsp.Error = ErrTimeout
 	}
 	kv.mu.Lock()
@@ -116,16 +119,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for !kv.killed() {
 			applyMsg := <-kv.applyCh
 			req := applyMsg.Command.(Request)
-			rsp := Response{}
+			rsp := Response{
+				Header: Header{
+					ClientId: req.ClientId,
+					ServerId: int64(kv.me),
+					SeqNum:   req.SeqNum,
+				},
+			}
 			if ok := kv.check(&req, &rsp); !ok {
 				kv.apply(&req, &rsp)
-				time.AfterFunc(TTL, func() {
-					kv.mu.Lock()
-					defer kv.mu.Unlock()
-					if cache, ok := kv.retrycache[req.ClientId]; ok && cache.SeqNum == req.SeqNum {
-						delete(kv.retrycache, req.ClientId)
-					}
-				})
 			}
 			kv.send(int64(applyMsg.CommandIndex), &rsp)
 		}
@@ -134,34 +136,30 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) check(req *Request, rsp *Response) bool {
-	if time.Since(req.CreateAt) > 2*TTL {
-		rsp.Error = ErrOutOfDate
-		return true
-	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if cache, ok := kv.retrycache[req.ClientId]; !ok {
 		return false
 	} else if req.SeqNum < cache.SeqNum {
-		rsp.Error = cache.Error
+		rsp.Error = ErrOutOfDate
 		return true
 	} else if req.SeqNum == cache.SeqNum {
-		rsp.Value, rsp.Error = cache.Value, NoErr
+		rsp.Value, rsp.Error = cache.Value, cache.Error
 		return true
 	} else {
 		return false
 	}
 }
 
-func (kv *KVServer) submit(req *Request) (chan Response, int64) {
+func (kv *KVServer) submit(req *Request) (chan Response, int, int64) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if index, _, isLeader := kv.rf.Start(*req); !isLeader {
-		return nil, -1
+	if index, term, isLeader := kv.rf.Start(*req); !isLeader {
+		return nil, -1, -1
 	} else {
 		DPrintf("server [%d]: submit req=%s", kv.me, req.String())
 		kv.connections[int64(index)] = make(chan Response)
-		return kv.connections[int64(index)], int64(index)
+		return kv.connections[int64(index)], term, int64(index)
 	}
 }
 

@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"fmt"
-	"time"
 )
 
 const (
@@ -19,9 +18,6 @@ const (
 	OpGet    = "Get"
 )
 
-// the timeout control for network package
-const TTL = time.Duration(500) * time.Millisecond
-
 type Err string
 
 type OpType string
@@ -30,7 +26,6 @@ type Header struct {
 	ClientId int64
 	ServerId int64 // for debug
 	SeqNum   int64
-	CreateAt time.Time
 }
 
 type Request struct {
@@ -54,5 +49,5 @@ func (req *Request) String() string {
 }
 
 func (rsp *Response) String() string {
-	return fmt.Sprintf("{value='%v', err=%v}", rsp.Value, rsp.Error)
+	return fmt.Sprintf("{value='%v', err=%v, server=%d}", rsp.Value, rsp.Error, rsp.ServerId)
 }

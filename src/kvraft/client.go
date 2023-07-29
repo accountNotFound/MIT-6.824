@@ -8,16 +8,14 @@ import (
 	"6.824/labrpc"
 )
 
-const RequestRetryInterval = time.Duration(100) * time.Millisecond
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	ClientId int64
-	SeqNum   int64
+	clientId int64
+	seqNum   int64
 
-	// NOTE: the LeaderId is just the ClientEnd's index and may not eqaul to KVServer.me !!!
-	LeaderId int
+	// NOTE: the leaderId is just the ClientEnd's index and may not eqaul to KVServer.me !!!
+	leaderId int
 }
 
 func nrand() int64 {
@@ -30,10 +28,11 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := &Clerk{
 		servers:  servers,
-		ClientId: nrand(),
-		SeqNum:   0,
-		LeaderId: 0,
+		clientId: nrand(),
+		seqNum:   0,
+		leaderId: 0,
 	}
+	DPrintf("client [%d] created", ck.clientId)
 	return ck
 }
 
@@ -48,17 +47,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	req := &Request{
-		Header: Header{
-			ClientId: ck.ClientId,
-			SeqNum:   ck.SeqNum,
-			CreateAt: time.Now(),
-		},
-		Key: key,
-		Op:  OpGet,
-	}
-	rsp := &Response{}
-	return ck.request(req, rsp)
+	return ck.request(key, "", OpGet)
 }
 
 // shared by Put and Append.
@@ -70,18 +59,7 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	req := &Request{
-		Header: Header{
-			ClientId: ck.ClientId,
-			SeqNum:   ck.SeqNum,
-			CreateAt: time.Now(),
-		},
-		Key:   key,
-		Value: value,
-		Op:    OpType(op),
-	}
-	rsp := &Response{}
-	ck.request(req, rsp)
+	ck.request(key, value, OpType(op))
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -91,28 +69,47 @@ func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
 
-func (ck *Clerk) request(req *Request, rsp *Response) string {
+func (ck *Clerk) request(key, value string, op OpType) string {
+	leaderId := ck.leaderId
 	for {
-		DPrintf("client [%d]: send req=%s", ck.ClientId, req.String())
-		if ok := ck.servers[ck.LeaderId].Call("KVServer.Access", req, rsp); !ok {
-			time.Sleep(RequestRetryInterval)
+		req := &Request{
+			Header: Header{
+				ClientId: ck.clientId,
+				SeqNum:   ck.seqNum,
+			},
+			Op:    op,
+			Key:   key,
+			Value: value,
+		}
+		rsp := &Response{}
+		DPrintf("client [%d]: send to (%d), req=%s", ck.clientId, ck.leaderId, req.String())
+		if ok := ck.servers[ck.leaderId].Call("KVServer.Access", req, rsp); !ok {
+			DPrintf("client [%d]: call (%d) fail", ck.clientId, ck.leaderId)
+			if ck.leaderId = (ck.leaderId + 1) % len(ck.servers); ck.leaderId == leaderId {
+				time.Sleep(300 * time.Millisecond)
+			}
 			continue
 		}
-		DPrintf("client [%d]: recv rsp=%s, server=%d, req=%s", ck.ClientId, rsp.String(), rsp.ServerId, req.String())
+		DPrintf("client [%d]: recv from (%d), rsp=%s, req=%s", ck.clientId, ck.leaderId, rsp.String(), req.String())
+		if ck.leaderId != int(rsp.ServerId) {
+			// for clear log, the index of servers doesn't equal to server.me
+			ck.servers[ck.leaderId], ck.servers[int(rsp.ServerId)] =
+				ck.servers[int(rsp.ServerId)], ck.servers[ck.leaderId]
+			ck.leaderId = (ck.leaderId - 1 + len(ck.servers)) % len(ck.servers)
+		}
 		switch rsp.Error {
 		case NoErr:
-			ck.SeqNum++
+			ck.seqNum++
 			return rsp.Value
 		case ErrNoKey:
-			ck.SeqNum++
+			ck.seqNum++
 			return ""
-		case ErrWrongLeader:
-			ck.LeaderId = (ck.LeaderId + 1) % len(ck.servers)
-			time.Sleep(RequestRetryInterval)
-		case ErrOutOfDate:
-			return ""
-		case ErrTimeout:
+		case ErrWrongLeader, ErrTimeout, ErrOutOfDate:
+			if ck.leaderId = (ck.leaderId + 1) % len(ck.servers); ck.leaderId == leaderId {
+				time.Sleep(300 * time.Millisecond)
+			}
 		default:
+			panic("unkown error")
 		}
 	}
 }
