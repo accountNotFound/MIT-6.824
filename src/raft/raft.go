@@ -143,6 +143,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if index <= rf.log.Head().Index {
+		return
+	}
 	rf.log.Trim(index)
 	state := rf.serialize()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
@@ -173,6 +176,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	info := rf.forUpdate()
 	defer rf.useUpdate("AppendEntries", info)
+	reply.SnapshotIndex = rf.log.Head().Index
+
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		reply.ExpectNextIndex = -1
@@ -355,6 +360,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.commitIndex = median
 		}
 	}
+	if reply.SnapshotIndex < rf.log.Head().Index {
+		args := &InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			Leader:            rf.me,
+			LastIncludedIndex: rf.log.Head().Index,
+			LastIncludedTerm:  rf.log.Head().Term,
+			Data:              rf.persister.ReadSnapshot(),
+		}
+		reply := &InstallSnapshotReply{}
+		go rf.sendInstallSnapshot(server, args, reply)
+	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -438,17 +454,8 @@ func (rf *Raft) startHeartbeat() {
 		}
 		rf.nextIndex[i] = Min(rf.nextIndex[i], rf.log.Size())
 		if rf.nextIndex[i] <= rf.log.Head().Index {
-			args := &InstallSnapshotArgs{
-				Term:              rf.currentTerm,
-				Leader:            rf.me,
-				LastIncludedIndex: rf.log.Head().Index,
-				LastIncludedTerm:  rf.log.Head().Term,
-				Data:              rf.persister.ReadSnapshot(),
-			}
-			reply := &InstallSnapshotReply{}
-			go rf.sendInstallSnapshot(i, args, reply)
-
 			// so that we can send heartbeat without entries below
+			// and we will send snapshot after sendAppendEntries done if necessary
 			rf.nextIndex[i] = rf.log.Size()
 		}
 		args := &AppendEntriesArgs{
