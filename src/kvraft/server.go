@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister   *raft.Persister
 	database    map[string]string
 	connections map[int64]chan Response
 	retrycache  map[int64]Response
@@ -107,6 +109,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		me:           me,
 		applyCh:      make(chan raft.ApplyMsg, 16),
 		dead:         0,
+		persister:    persister,
 		maxraftstate: maxraftstate,
 		database:     make(map[string]string),
 		connections:  make(map[int64]chan Response),
@@ -118,6 +121,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func() {
 		for !kv.killed() {
 			applyMsg := <-kv.applyCh
+			if applyMsg.SnapshotValid {
+				kv.mu.Lock()
+				kv.deserialize(applyMsg.Snapshot)
+				kv.mu.Unlock()
+				continue
+			}
 			req := applyMsg.Command.(Request)
 			rsp := Response{
 				Header: Header{
@@ -127,7 +136,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				},
 			}
 			if ok := kv.check(&req, &rsp); !ok {
-				kv.apply(&req, &rsp)
+				kv.apply(&applyMsg, &req, &rsp)
 			}
 			kv.send(int64(applyMsg.CommandIndex), &rsp)
 		}
@@ -163,7 +172,7 @@ func (kv *KVServer) submit(req *Request) (chan Response, int, int64) {
 	}
 }
 
-func (kv *KVServer) apply(req *Request, rsp *Response) {
+func (kv *KVServer) apply(applyMsg *raft.ApplyMsg, req *Request, rsp *Response) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	switch req.Op {
@@ -183,6 +192,10 @@ func (kv *KVServer) apply(req *Request, rsp *Response) {
 	kv.retrycache[req.ClientId] = *rsp
 	if _, isLeader := kv.rf.GetState(); isLeader {
 		DPrintf("server [%d]: apply req=%s", kv.me, req.String())
+		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+			data := kv.serialize()
+			kv.rf.Snapshot(applyMsg.CommandIndex, data)
+		}
 	}
 }
 
@@ -191,5 +204,26 @@ func (kv *KVServer) send(index int64, rsp *Response) {
 	defer kv.mu.Unlock()
 	if conn, ok := kv.connections[index]; ok {
 		conn <- *rsp
+	}
+}
+
+func (kv *KVServer) serialize() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.database)
+	e.Encode(kv.retrycache)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) deserialize(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.database) != nil ||
+		d.Decode(&kv.retrycache) != nil {
+		panic("load kv state failed")
 	}
 }

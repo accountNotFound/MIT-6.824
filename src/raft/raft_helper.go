@@ -139,6 +139,7 @@ type AppendEntriesReply struct {
 	Term            int
 	Success         bool
 	ExpectNextIndex int
+	SnapshotIndex   int
 }
 
 // install snapshot in just on rpc so that the implementation is more easily
